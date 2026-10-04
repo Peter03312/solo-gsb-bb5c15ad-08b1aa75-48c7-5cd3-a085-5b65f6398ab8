@@ -260,3 +260,14 @@ button.danger { background: transparent; border: 1px solid var(--danger); color:
 .sp-cue { font-size: 13px; line-height: 1.4; word-break: break-word; }
 .sp-history { font-size: 12px; color: #718096; }
 .sp-history div { padding: 2px 0; }
+
+/* ---------- ⑨ 译审术语表 ---------- */
+.gl-editor { display: flex; flex-direction: column; gap: 6px; margin: 8px 0; }
+.gl-row { display: grid; grid-template-columns: 1fr 24px 1fr auto; gap: 6px; align-items: center; }
+.gl-row .gl-arrow { text-align: center; color: #718096; }
+.gl-row .gl-del { padding: 4px 8px; font-size: 12px; }
+.gl-missing { margin-top: 8px; display: flex; flex-direction: column; gap: 4px; }
+.gl-miss {
+  font-size: 12px; color: #c53030; background: #fff5f5;
+  border: 1px solid #feb2b2; border-radius: 6px; padding: 4px 8px;
+}

@@ -27,6 +27,7 @@
 
 const { validateStructure, validateRules } = require('./layout');
 const { normalizeLang, checkTranslationText, activeTranslationsByLang } = require('./translation');
+const { listTermsByLang, findMissingTerms, getTermVersion } = require('./glossary');
 
 function isInt(v) {
   return typeof v === 'number' && Number.isInteger(v);
@@ -456,6 +457,8 @@ function evaluateAttributedExport(db, project, request) {
   const translationByCue = request.lang
     ? activeTranslationsByLang(db, project.id, request.lang)
     : new Map();
+  // 术语核对仅作用于译文署名导出：原文署名导出与未配置术语的语言不受影响。
+  const glossaryTerms = request.lang ? listTermsByLang(db, project.id, request.lang) : [];
   const submittedVersionByCue = new Map(
     request.translations.map((t) => [t.subtitle_id, t.version])
   );
@@ -515,7 +518,16 @@ function evaluateAttributedExport(db, project, request) {
             codes.push('translation_invalid');
             reasons.push(...ruleReasons);
           } else {
-            text = tr.text;
+            // current、版本一致且字数/字速通过：再按当前术语核对命中词的规定译法
+            const missingTerms = findMissingTerms(cue.text, tr.text, glossaryTerms);
+            if (missingTerms.length > 0) {
+              codes.push('translation_term_missing');
+              reasons.push(...missingTerms.map(
+                (m) => `原文命中术语源词 ${JSON.stringify(m.source_term)}，译文须包含规定译法 ${JSON.stringify(m.target_term)}`
+              ));
+            } else {
+              text = tr.text;
+            }
           }
         }
       }
@@ -546,6 +558,13 @@ function evaluateAttributedExport(db, project, request) {
                   : null;
               })(),
               submitted_version: submittedVersionByCue.get(cue.id) ?? null,
+              term_missing: codes.includes('translation_term_missing')
+                ? findMissingTerms(
+                    cue.text,
+                    (translationByCue.get(cue.id) || {}).text || '',
+                    glossaryTerms
+                  )
+                : [],
             }
           : {}),
       });
@@ -566,6 +585,7 @@ function evaluateAttributedExport(db, project, request) {
     sub_version_current: project.sub_version,
     attribution_version_current: project.attribution_version,
     rules_version_current: project.rules.version,
+    term_version: request.lang ? getTermVersion(db, project.id) : null,
   };
 }
 
@@ -580,8 +600,8 @@ function insertAttributedExport(db, projectId, fields) {
   const info = db.prepare(
     `INSERT INTO attributed_exports
        (project_id, kind, lang, version, content, cue_count,
-        sub_version, attribution_version, rules_version)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        sub_version, attribution_version, rules_version, term_version)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(
     projectId,
     fields.kind,
@@ -591,7 +611,8 @@ function insertAttributedExport(db, projectId, fields) {
     fields.cue_count,
     fields.sub_version,
     fields.attribution_version,
-    fields.rules_version
+    fields.rules_version,
+    fields.term_version === undefined ? null : fields.term_version
   );
   return db.prepare('SELECT * FROM attributed_exports WHERE id = ?').get(info.lastInsertRowid);
 }
@@ -600,7 +621,7 @@ function insertAttributedExport(db, projectId, fields) {
 function listAttributedExports(db, projectId) {
   return db.prepare(
     `SELECT id, kind, lang, version, cue_count, sub_version, attribution_version,
-            rules_version, created_at
+            rules_version, term_version, created_at
        FROM attributed_exports WHERE project_id = ? ORDER BY version DESC`
   ).all(projectId);
 }

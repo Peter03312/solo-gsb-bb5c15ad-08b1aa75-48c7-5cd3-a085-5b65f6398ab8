@@ -67,6 +67,7 @@ async function loadProjects(selectId) {
   state.spView = null;
   $('#tr-panel').classList.add('hidden');
   $('#sp-panel').classList.add('hidden');
+  $('#gl-panel').classList.add('hidden');
   await loadProject(Number(sel.value));
 }
 
@@ -92,6 +93,7 @@ function renderAll() {
   renderRevisions();
   renderWordRevisions();
   renderSpeakerVersionTag();
+  renderGlossaryVersionTag();
   $('#force-row').classList.add('hidden');
 }
 
@@ -880,7 +882,8 @@ function renderTranslations() {
   $('#tr-lang-tag').textContent = view.lang;
   const c = view.counts;
   $('#tr-stats').textContent =
-    `共 ${c.cues} 条 · 当前 ${c.current}（有效 ${c.valid}）· 待复核 ${c.review} · 缺译 ${c.missing} · 历史 ${view.history.length}`;
+    `共 ${c.cues} 条 · 当前 ${c.current}（有效 ${c.valid}）· 待复核 ${c.review} · 缺译 ${c.missing} · 历史 ${view.history.length}` +
+    (view.glossary?.configured ? ` · 术语 v${view.glossary.term_version}：缺失 ${view.glossary.missing_count} 处` : ' · 未配置术语');
 
   const box = $('#tr-table');
   box.innerHTML = '';
@@ -927,6 +930,9 @@ function renderTranslations() {
       (e.translation ? ` <span class="hint">译文 v${e.translation.version}</span>` : '');
     for (const reason of e.invalid_reasons) {
       tagLine.innerHTML += `<div class="tr-reason">• ${escapeHtml(reason)}</div>`;
+    }
+    for (const m of (e.term_missing || [])) {
+      tagLine.innerHTML += `<div class="tr-reason">• 术语：原文命中 ${escapeHtml(m.source_term)}，译文须包含规定译法 ${escapeHtml(m.target_term)}</div>`;
     }
     wrap.append(input, meta, tagLine);
 
@@ -1317,4 +1323,125 @@ $('#btn-sp-create').addEventListener('click', createSpeaker);
 $('#btn-sp-load').addEventListener('click', () => loadSpeakers(false));
 $('#btn-sp-export-src').addEventListener('click', () => exportAttributed(false));
 $('#btn-sp-export-tr').addEventListener('click', () => exportAttributed(true));
+
+// ---------- ⑨ 译审术语表 ----------
+
+const glState = { lang: null, termVersion: null, terms: [] };
+
+function renderGlossaryVersionTag() {
+  const el = $('#gl-version');
+  if (!el) return;
+  el.textContent = state.project ? `术语 v${state.project.term_version ?? 0}` : '';
+}
+
+function renderGlossaryEditor() {
+  const editor = $('#gl-editor');
+  editor.innerHTML = '';
+  glState.terms.forEach((t, i) => {
+    const row = document.createElement('div');
+    row.className = 'gl-row';
+    const src = document.createElement('input');
+    src.type = 'text'; src.className = 'text-input gl-src';
+    src.value = t.source_term; src.placeholder = '源词（原文精确匹配）';
+    const arrow = document.createElement('span'); arrow.className = 'gl-arrow'; arrow.textContent = '→';
+    const tgt = document.createElement('input');
+    tgt.type = 'text'; tgt.className = 'text-input gl-tgt';
+    tgt.value = t.target_term; tgt.placeholder = '规定译法（命中行译文须包含）';
+    const del = document.createElement('button');
+    del.className = 'secondary gl-del'; del.textContent = '删除';
+    del.addEventListener('click', () => { glState.terms.splice(i, 1); renderGlossaryEditor(); });
+    src.addEventListener('input', () => { glState.terms[i].source_term = src.value; });
+    tgt.addEventListener('input', () => { glState.terms[i].target_term = tgt.value; });
+    row.append(src, arrow, tgt, del);
+    editor.appendChild(row);
+  });
+}
+
+async function loadGlossaryLang() {
+  const p = state.project;
+  if (!p) return;
+  const raw = $('#gl-lang').value.trim();
+  const lang = raw;
+  if (!/^[A-Za-z][A-Za-z0-9_-]{0,31}$/.test(lang)) {
+    toast('语言代号须非空、≤32 字、字母开头（如 en、ja-JP）', true);
+    return;
+  }
+  const { status, body } = await api(`/api/projects/${p.id}/glossary/${encodeURIComponent(lang)}`);
+  if (status !== 200) { toast(body?.error || '载入术语失败', true); return; }
+  glState.lang = lang;
+  glState.termVersion = body.term_version;
+  glState.terms = body.terms.map((t) => ({ source_term: t.source_term, target_term: t.target_term }));
+  $('#gl-panel').classList.remove('hidden');
+  $('#gl-lang-tag').textContent = `${lang} · 术语 v${body.term_version}（${body.term_count} 条）`;
+  $('#gl-missing').innerHTML = '';
+  renderGlossaryEditor();
+  if (glState.terms.length === 0) {
+    glState.terms.push({ source_term: '', target_term: '' });
+    renderGlossaryEditor();
+  }
+}
+
+async function saveGlossary() {
+  const p = state.project;
+  if (!p || !glState.lang) return;
+  const terms = glState.terms
+    .map((t) => ({ source_term: t.source_term.trim(), target_term: t.target_term.trim() }))
+    .filter((t) => t.source_term !== '' || t.target_term !== '');
+  const { status, body } = await api(
+    `/api/projects/${p.id}/glossary/${encodeURIComponent(glState.lang)}`,
+    { method: 'PUT', body: JSON.stringify({ term_version: glState.termVersion, terms }) }
+  );
+  if (status === 409) {
+    toast(`${body.error}（已刷新为当前表）`, true);
+    glState.termVersion = body.current.term_version;
+    const cur = body.current.languages.find((l) => l.lang === glState.lang);
+    glState.terms = cur ? cur.terms.map((t) => ({ source_term: t.source_term, target_term: t.target_term })) : [];
+    renderGlossaryEditor();
+    return;
+  }
+  if (status !== 200) { toast(body?.errors?.join('；') || body?.error || '保存失败', true); return; }
+  glState.termVersion = body.term_version;
+  glState.terms = body.terms.map((t) => ({ source_term: t.source_term, target_term: t.target_term }));
+  renderGlossaryEditor();
+  $('#gl-lang-tag').textContent = `${glState.lang} · 术语 v${body.term_version}（${body.terms.length} 条）`;
+  renderGlossaryVersionTag();
+  toast(`术语表已保存（${body.updated} 条），术语版本 v${body.term_version}`);
+  if (state.trLang === glState.lang) loadTranslation(glState.lang);
+}
+
+async function checkGlossary() {
+  const p = state.project;
+  if (!p || !glState.lang) return;
+  const { status, body } = await api(
+    `/api/projects/${p.id}/glossary/${encodeURIComponent(glState.lang)}/check`,
+    { method: 'POST', body: JSON.stringify({}) }
+  );
+  if (status !== 200) { toast(body?.error || '查询失败', true); return; }
+  const box = $('#gl-missing');
+  if (!body.configured) {
+    box.innerHTML = `<p class="hint">语言 ${glState.lang} 尚未配置术语，核对不限制该语言（术语 v${body.term_version}）。</p>`;
+    return;
+  }
+  if (body.items.length === 0) {
+    box.innerHTML = `<p class="hint">✓ 全部命中行都包含规定译法（术语 v${body.term_version}）。</p>`;
+    return;
+  }
+  box.innerHTML =
+    `<p class="hint">共 ${body.missing_count} 处缺失（术语 v${body.term_version}）：</p>` +
+    body.items.map((it) =>
+      `<div class="gl-miss">字幕 #${it.subtitle_id}（第 ${it.idx + 1} 行）：源词 ` +
+      `<code>${escapeHtml(it.source_term)}</code> → 译文须包含 <code>${escapeHtml(it.target_term)}</code></div>`
+    ).join('');
+}
+
+$('#btn-gl-load').addEventListener('click', loadGlossaryLang);
+$('#gl-lang').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') { e.preventDefault(); $('#btn-gl-load').click(); }
+});
+$('#btn-gl-add').addEventListener('click', () => {
+  glState.terms.push({ source_term: '', target_term: '' });
+  renderGlossaryEditor();
+});
+$('#btn-gl-save').addEventListener('click', saveGlossary);
+$('#btn-gl-check').addEventListener('click', checkGlossary);
 

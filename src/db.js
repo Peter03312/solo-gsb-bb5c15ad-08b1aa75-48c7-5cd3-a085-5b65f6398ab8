@@ -14,6 +14,9 @@ CREATE TABLE IF NOT EXISTS projects (
   sub_version INTEGER NOT NULL DEFAULT 0,   -- 字幕集每次变更（编辑/锁定/重排）都 +1，用于乐观锁
   -- 归属版本：说话人显示名修改或归属标注写入时 +1；归属标注与署名导出携带以防并发覆盖
   attribution_version INTEGER NOT NULL DEFAULT 0,
+  -- 术语版本：译审维护术语表（增删改任一语言的源词/规定译法）时 +1；
+  -- 术语表修改携带它做乐观锁，各导出/核对在事务内读取当前术语，快照记录核对时版本。
+  term_version INTEGER NOT NULL DEFAULT 0,
   created_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -64,6 +67,7 @@ CREATE TABLE IF NOT EXISTS exports (
   version    INTEGER NOT NULL,               -- 项目内递增，确认一次 +1
   content    TEXT NOT NULL,                  -- WebVTT 快照，确认后不再改变
   cue_count  INTEGER NOT NULL,
+  term_version INTEGER,                      -- 核对通过时的术语版本（未配置术语时也记录当前值）
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   UNIQUE(project_id, version)
 );
@@ -158,6 +162,7 @@ CREATE TABLE IF NOT EXISTS translation_exports (
   version    INTEGER NOT NULL,               -- 项目内按语言递增，确认一次 +1
   content    TEXT NOT NULL,                  -- WebVTT 快照，确认后不再改变
   cue_count  INTEGER NOT NULL,
+  term_version INTEGER,                      -- 核对通过时该语言的术语版本
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   UNIQUE(project_id, lang, version)
 );
@@ -284,9 +289,28 @@ CREATE TABLE IF NOT EXISTS attributed_exports (
   sub_version       INTEGER NOT NULL,         -- 快照时字幕集版本
   attribution_version INTEGER NOT NULL,       -- 快照时归属版本
   rules_version     INTEGER NOT NULL,         -- 快照时规则版本
+  term_version      INTEGER,                  -- 快照时术语版本（选择译文时按该语言核对）
   created_at        TEXT NOT NULL DEFAULT (datetime('now')),
   UNIQUE(project_id, version)
 );
+
+-- 译审术语表：按目标语言维护“源词（原文字幕中的词）→ 规定译法”。
+-- 源词与译法均为非空文本；同一语言内源词不得重复（唯一索引强制）。
+-- 术语表整体带项目级 term_version（projects.term_version）：每次修改 +1，
+-- 修改请求携带读取时版本做乐观锁，过期返回当前整表。术语只影响“当前术语核对”，
+-- 不改变既有译文的 current/review 状态，也不影响已生成的导出快照。
+CREATE TABLE IF NOT EXISTS glossary_terms (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id  INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  lang        TEXT NOT NULL,                  -- 目标语言代号（与译文语言一致，如 en / ja-JP）
+  source_term TEXT NOT NULL,                  -- 源词（非空文本，按原文字幕文本精确匹配）
+  target_term TEXT NOT NULL,                  -- 规定译法（非空文本，命中行译文须包含它）
+  created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE(project_id, lang, source_term)
+);
+CREATE INDEX IF NOT EXISTS idx_glossary_project_lang
+  ON glossary_terms(project_id, lang);
 `;
 
 const DEFAULT_RULES = { max_chars: 30, min_duration_ms: 800, max_cps: 20 };
@@ -303,12 +327,23 @@ function initDb(dbPath) {
 
 /**
  * 轻量迁移：旧库在本次新增 speakers/attributions 前已建表，补齐列。
- * CREATE TABLE IF NOT EXISTS 只负责新表；已存在的 projects 表需要手动加列。
+ * CREATE TABLE IF NOT EXISTS 只负责新表；已存在的 projects/导出表需要手动加列。
  */
 function migrate(db) {
   const cols = db.prepare('PRAGMA table_info(projects)').all().map((c) => c.name);
   if (!cols.includes('attribution_version')) {
     db.exec('ALTER TABLE projects ADD COLUMN attribution_version INTEGER NOT NULL DEFAULT 0');
+  }
+  // 本轮新增：项目级术语版本；旧库默认 0（未配置任何术语）。
+  if (!cols.includes('term_version')) {
+    db.exec('ALTER TABLE projects ADD COLUMN term_version INTEGER NOT NULL DEFAULT 0');
+  }
+  // 各导出序列补记“核对通过时的术语版本”（旧快照为 NULL，内容与下载约定保持不变）。
+  for (const table of ['exports', 'translation_exports', 'attributed_exports']) {
+    const tcols = db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name);
+    if (!tcols.includes('term_version')) {
+      db.exec(`ALTER TABLE ${table} ADD COLUMN term_version INTEGER`);
+    }
   }
 }
 
@@ -348,6 +383,7 @@ function loadProject(db, id) {
     name: project.name,
     sub_version: project.sub_version,
     attribution_version: project.attribution_version,
+    term_version: project.term_version,
     created_at: project.created_at,
     words,
     cuts,
@@ -422,6 +458,12 @@ function bumpAttributionVersion(db, projectId) {
   return db.prepare('SELECT attribution_version FROM projects WHERE id = ?').get(projectId).attribution_version;
 }
 
+/** 术语版本 +1（术语表增删改成功时调用），返回推进后的版本 */
+function bumpTermVersion(db, projectId) {
+  db.prepare('UPDATE projects SET term_version = term_version + 1 WHERE id = ?').run(projectId);
+  return db.prepare('SELECT term_version FROM projects WHERE id = ?').get(projectId).term_version;
+}
+
 /** 项目下全部逐词修正提议摘要（不含逐项明细），按时间倒序 */
 function listWordRevisions(db, projectId) {
   return db.prepare(
@@ -471,6 +513,7 @@ function loadWordRevision(db, projectId, revisionId) {
 
 module.exports = {
   initDb, loadProject, listRevisions, loadRevision,
-  listWordRevisions, loadWordRevision, bumpSubVersion, bumpAttributionVersion,
+  listWordRevisions, loadWordRevision,
+  bumpSubVersion, bumpAttributionVersion, bumpTermVersion,
   DEFAULT_RULES,
 };

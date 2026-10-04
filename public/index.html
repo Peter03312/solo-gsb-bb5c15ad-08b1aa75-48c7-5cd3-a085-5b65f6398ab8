@@ -125,6 +125,17 @@
         <ul id="sp-export-list" class="export-list"></ul>
         <p class="hint">署名版另存为<strong>不可变快照</strong>（WebVTT 说话人标签 <code>&lt;v 名称&gt;…&lt;/v&gt;</code>）；普通导出与旧下载内容不变，原文与译文共用时间轴。</p>
       </section>
+      <section class="panel">
+        <h2>⑨ 译审术语表 <span id="gl-version" class="tag"></span></h2>
+        <p class="hint">为各目标语言维护<strong>源词→规定译法</strong>对照（均非空、同语言源词不重复）。
+        按当前原文字幕<strong>精确匹配</strong>源词，命中行译文须包含规定译法（一行多词全部满足）；
+        未配置术语的语言不受影响。保存译文不拦截术语，但<strong>单语言导出/多语交付/译文署名导出</strong>会在事务内核对，任一缺失逐行报错且不生成快照。</p>
+        <div class="row">
+          <input id="gl-lang" type="text" placeholder="目标语言代号（如 en、ja-JP）" spellcheck="false">
+          <button id="btn-gl-load" class="secondary">载入术语</button>
+        </div>
+        <p class="hint" id="gl-hint">载入语言后可编辑该语言对照表（整体保存，携带术语版本做乐观锁）。</p>
+      </section>
     </aside>
 
     <section class="content">
@@ -172,6 +183,18 @@
         <ul id="sp-export-list2" class="export-list"></ul>
         <h3>历史归属（原行已删除，留档，不按序号转移）</h3>
         <div id="sp-history" class="sp-history"></div>
+      </div>
+
+      <div id="gl-panel" class="panel hidden">
+        <h2>术语表 <span id="gl-lang-tag" class="tag"></span></h2>
+        <p class="hint">整体替换该语言对照表并携带读取时<strong>术语版本</strong>；过期会返回当前表。保存后可在「⑦ 多语言译文字幕」里查看每行缺失，或点下方按钮查询。</p>
+        <div id="gl-editor" class="gl-editor"></div>
+        <div class="row buttons">
+          <button id="btn-gl-add" class="secondary">＋ 增加词条</button>
+          <button id="btn-gl-save" class="primary">保存术语表</button>
+          <button id="btn-gl-check" class="secondary">查询当前缺失</button>
+        </div>
+        <div id="gl-missing" class="gl-missing"></div>
       </div>
 
       <div class="panel">

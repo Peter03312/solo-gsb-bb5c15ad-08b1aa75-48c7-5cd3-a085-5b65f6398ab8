@@ -27,6 +27,7 @@ const {
   buildAttributionView, parseAttributedExportBody, evaluateAttributedExport,
   insertAttributedExport, listAttributedExports, getAttributedExport,
 } = speakerMod;
+const glossary = require('./glossary');
 const { toWebVtt } = require('./vtt');
 
 /**
@@ -664,11 +665,12 @@ function createApp(db) {
       if (result.conflicts.length > 0 || result.rows.length > 0) {
         throw new ExportReject(422, {
           error: result.lang
-            ? `署名版译文导出（${result.lang}）未通过核对：整版冲突 ${result.conflicts.length} 处，逐行问题 ${result.rows.length} 行；未生成快照`
+            ? `署名版译文导出（${result.lang}）未通过核对：整版冲突 ${result.conflicts.length} 处，逐行问题 ${result.rows.length} 行（含术语缺失）；未生成快照`
             : `署名版原文导出未通过核对：整版冲突 ${result.conflicts.length} 处，逐行问题 ${result.rows.length} 行；未生成快照`,
           sub_version: fresh.sub_version,
           attribution_version: fresh.attribution_version,
           rules_version: fresh.rules.version,
+          term_version: result.term_version,
           conflicts: result.conflicts,
           rows: result.rows,
         });
@@ -684,6 +686,8 @@ function createApp(db) {
         sub_version: fresh.sub_version,
         attribution_version: fresh.attribution_version,
         rules_version: fresh.rules.version,
+        // 原文署名导出不做术语核对（term_version 为 null）；译文署名导出记录核对时术语版本
+        term_version: result.term_version,
       });
       return { saved, content };
     });
@@ -698,6 +702,7 @@ function createApp(db) {
         sub_version: done.saved.sub_version,
         attribution_version: done.saved.attribution_version,
         rules_version: done.saved.rules_version,
+        term_version: done.saved.term_version,
         download_url: `/api/projects/${p.id}/attributed-exports/${done.saved.version}`,
         content: done.content,
       });
@@ -1272,7 +1277,7 @@ function createApp(db) {
     return lang;
   }
 
-  /** 项目语言总览（各语言译文状态分布 + 导出数） */
+  /** 项目语言总览（各语言译文状态分布 + 导出数 + 术语配置） */
   app.get('/api/projects/:id/translations', (req, res) => {
     const p = getProject(req, res);
     if (!p) return;
@@ -1280,6 +1285,7 @@ function createApp(db) {
       project_id: p.id,
       sub_version: p.sub_version,
       rules_version: p.rules ? p.rules.version : null,
+      term_version: p.term_version,
       cue_count: p.subtitles.length,
       languages: listLanguages(db, p.id),
     });
@@ -1460,36 +1466,43 @@ function createApp(db) {
       });
     }
 
-    const check = evaluateExport(db, p.id, lang);
+    // 术语核对与其他核对同一事务内对权威状态执行：任一缺失逐行报错且不生成快照
+    const check = db.transaction(() => evaluateExport(db, p.id, lang))();
     if (!check.ok) {
       const problems =
-        check.missing.length + check.review.length + check.invalid.length + check.conflicts.length;
+        check.missing.length + check.review.length + check.invalid.length +
+        check.terminology.length + check.conflicts.length;
       return res.status(422).json({
         error: `语言 ${lang} 未通过导出核对（${problems} 处问题），未生成快照`,
+        term_version: check.term_version,
         missing: check.missing,
         review: check.review,
         invalid: check.invalid,
+        terminology: check.terminology,
         conflicts: check.conflicts,
       });
     }
 
-    // 译文沿用源字幕起止：按 idx（时间升序）取译文文本生成 WebVTT
+    // 译文沿用源字幕起止：按 idx（时间升序）取译文文本生成 WebVTT。
+    // 术语核对通过后的快照记录当前 term_version（内容不可变，之后术语变更不影响旧快照）。
     const cues = check.entries.map((e, i) => ({
       start_ms: e.cue.start_ms, end_ms: e.cue.end_ms, text: e.translation.text, idx: i,
     }));
     const content = toWebVtt(cues);
-    const version = db.transaction(() => {
+    const result = db.transaction(() => {
       const next = (db.prepare(
         'SELECT COALESCE(MAX(version), 0) AS v FROM translation_exports WHERE project_id = ? AND lang = ?'
       ).get(p.id, lang).v) + 1;
       db.prepare(
-        'INSERT INTO translation_exports (project_id, lang, version, content, cue_count) VALUES (?, ?, ?, ?, ?)'
-      ).run(p.id, lang, next, content, cues.length);
-      return next;
+        `INSERT INTO translation_exports (project_id, lang, version, content, cue_count, term_version)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      ).run(p.id, lang, next, content, cues.length, check.term_version);
+      return { next, term_version: check.term_version };
     })();
     res.status(201).json({
-      lang, version, cue_count: cues.length,
-      download_url: `/api/projects/${p.id}/translations/${encodeURIComponent(lang)}/exports/${version}`,
+      lang, version: result.next, cue_count: cues.length,
+      term_version: result.term_version,
+      download_url: `/api/projects/${p.id}/translations/${encodeURIComponent(lang)}/exports/${result.next}`,
       content,
     });
   });
@@ -1864,7 +1877,7 @@ function createApp(db) {
       const activeByLang = new Map(
         request.languages.map((lang) => [lang, activeTranslationsByLang(db, fresh.id, lang)])
       );
-      const result = evaluateDelivery(fresh, request, activeByLang);
+      const result = evaluateDelivery(db, fresh, request, activeByLang);
 
       // 4. 版本漂移（字幕集/规则）：整批拒绝，带当前值；不消耗任何版本
       if (result.sub_version_stale || result.rules_version_stale) {
@@ -1883,20 +1896,22 @@ function createApp(db) {
             sub_version: fresh.sub_version,
             rules_version: fresh.rules.version,
             rules: fresh.rules,
+            term_version: result.term_version,
             subtitles: fresh.subtitles,
           },
         });
       }
 
-      // 5. 源整版结构/规则冲突，或任一语言缺译/待复核/无效/译文版本漂移：整批拒绝
+      // 5. 源整版结构/规则冲突，或任一语言缺译/待复核/无效/术语缺失/译文版本漂移：整批拒绝
       const langProblems = result.languages.filter((l) => l.problem_count > 0);
       if (result.conflicts.length > 0 || langProblems.length > 0) {
         throw new DeliveryReject(422, {
           error:
             `交付核对未通过（源整版冲突 ${result.conflicts.length} 处，` +
-            `${langProblems.length}/${request.languages.length} 种语言存在缺译/待复核/无效/版本漂移），整批未生成快照或消耗版本`,
+            `${langProblems.length}/${request.languages.length} 种语言存在缺译/待复核/无效/术语缺失/版本漂移），整批未生成快照或消耗版本`,
           sub_version: fresh.sub_version,
           rules_version: fresh.rules.version,
+          term_version: result.term_version,
           conflicts: result.conflicts,
           languages: result.languages.map((l) => ({
             lang: l.lang,
@@ -1904,6 +1919,7 @@ function createApp(db) {
             missing: l.missing,
             review: l.review,
             invalid: l.invalid,
+            terminology: l.terminology,
             version_stale: l.version_stale,
           })),
         });
@@ -1928,22 +1944,24 @@ function createApp(db) {
         fresh.subtitles.length, request.languages.length);
       const batchId = batchInfo.lastInsertRowid;
 
-      // 原文：在现有 exports 序列占一个普通版本
+      // 原文：在现有 exports 序列占一个普通版本（术语核对只作用于译文，原文快照记录当前术语版本备档）
       const srcVersion = (db.prepare(
         'SELECT COALESCE(MAX(version), 0) AS v FROM exports WHERE project_id = ?'
       ).get(fresh.id).v) + 1;
       const srcExportId = db.prepare(
-        'INSERT INTO exports (project_id, version, content, cue_count) VALUES (?, ?, ?, ?)'
-      ).run(fresh.id, srcVersion, sourceContent, fresh.subtitles.length).lastInsertRowid;
+        'INSERT INTO exports (project_id, version, content, cue_count, term_version) VALUES (?, ?, ?, ?, ?)'
+      ).run(fresh.id, srcVersion, sourceContent, fresh.subtitles.length, result.term_version).lastInsertRowid;
       db.prepare(
         `INSERT INTO delivery_files
            (batch_id, project_id, kind, lang, export_kind, export_id, version, cue_count, ord)
          VALUES (?, ?, 'source', NULL, 'exports', ?, ?, ?, 0)`
       ).run(batchId, fresh.id, srcExportId, srcVersion, fresh.subtitles.length);
 
-      // 各语言：在现有 translation_exports 序列（按语言独立）各占一个普通版本
+      // 各语言：在现有 translation_exports 序列（按语言独立）各占一个普通版本；
+      // 术语核对在同一事务已通过，快照记录当前 term_version。
       const insLang = db.prepare(
-        'INSERT INTO translation_exports (project_id, lang, version, content, cue_count) VALUES (?, ?, ?, ?, ?)'
+        `INSERT INTO translation_exports (project_id, lang, version, content, cue_count, term_version)
+         VALUES (?, ?, ?, ?, ?, ?)`
       );
       const insFile = db.prepare(
         `INSERT INTO delivery_files
@@ -1954,7 +1972,9 @@ function createApp(db) {
         const next = (db.prepare(
           'SELECT COALESCE(MAX(version), 0) AS v FROM translation_exports WHERE project_id = ? AND lang = ?'
         ).get(fresh.id, lang).v) + 1;
-        const exportId = insLang.run(fresh.id, lang, next, contents.get(lang), fresh.subtitles.length).lastInsertRowid;
+        const exportId = insLang.run(
+          fresh.id, lang, next, contents.get(lang), fresh.subtitles.length, result.term_version
+        ).lastInsertRowid;
         insFile.run(batchId, fresh.id, lang, exportId, next, fresh.subtitles.length, i + 1);
       });
 
@@ -1991,6 +2011,119 @@ function createApp(db) {
     const batch = loadBatch(db, p.id, Number(req.params.bid));
     if (!batch) return res.status(404).json({ error: `交付批次 ${req.params.bid} 不存在` });
     res.json(batch);
+  });
+
+  // ---------- 译审术语表（源词 → 规定译法，按语言维护，带术语版本） ----------
+  //
+  // 译审为项目各目标语言维护术语对照表：源词与译法均为非空文本，同语言源词不得重复；
+  // 修改按语言整体替换并携带读取时 term_version，过期返回当前表（409）；每次修改推进
+  // 项目术语版本。按当前原文字幕文本精确匹配源词，命中行译文须包含对应规定译法（一行多
+  // 词全部满足）；未配置术语的语言不受影响。术语只参与查询/导出核对：译文仍可保存供修正，
+  // 术语变更不改变既有译文 current/review 状态，也不影响旧导出快照。
+
+  /** 术语总览（各语言条数与对照表、当前 term_version） */
+  app.get('/api/projects/:id/glossary', (req, res) => {
+    const p = getProject(req, res);
+    if (!p) return;
+    res.json(glossary.buildGlossaryView(db, p.id));
+  });
+
+  /** 单语言术语表（附当前 term_version；语言代号非法 → 400） */
+  app.get('/api/projects/:id/glossary/:lang', (req, res) => {
+    const p = getProject(req, res);
+    if (!p) return;
+    const lang = getLang(req, res);
+    if (!lang) return;
+    res.json({
+      project_id: p.id,
+      lang,
+      term_version: p.term_version,
+      term_count: db.prepare(
+        'SELECT COUNT(*) AS n FROM glossary_terms WHERE project_id = ? AND lang = ?'
+      ).get(p.id, lang).n,
+      terms: glossary.listTermsByLang(db, p.id, lang),
+    });
+  });
+
+  /**
+   * 修改某语言术语表（整体替换）：{term_version, terms:[{source_term, target_term}]}。
+   * terms 允许空数组（清空该语言）；源词/译法非空、同语言源词不重复。
+   * 200 成功并推进项目 term_version；400 形状非法；409 term_version 过期（返回当前整表）。
+   */
+  app.put('/api/projects/:id/glossary/:lang', (req, res) => {
+    const p = getProject(req, res);
+    if (!p) return;
+    const lang = getLang(req, res);
+    if (!lang) return;
+
+    const parsed = glossary.parseGlossaryBody(req.body);
+    if (!parsed.ok) {
+      return res.status(400).json({ error: '术语表修改请求非法，未修改', errors: parsed.errors });
+    }
+    if (parsed.termVersion !== p.term_version) {
+      return res.status(409).json({
+        error: `术语版本过期：你基于 v${parsed.termVersion} 修改，当前已是 v${p.term_version}`,
+        current: glossary.buildGlossaryView(db, p.id),
+      });
+    }
+
+    const done = glossary.replaceLangTerms(db, p.id, lang, parsed.terms);
+    res.status(200).json({
+      project_id: p.id,
+      lang,
+      updated: parsed.terms.length,
+      term_version: done.term_version,
+      terms: done.terms,
+    });
+  });
+
+  /**
+   * 术语缺失查询（只读）：按语言、字幕 ID 与源词列出缺失译法及当前术语版本。
+   *   {} 或 {subtitle_ids:[]}                  → 核对该语言全部当前字幕
+   *   {subtitle_ids:[...]}                     → 只核对指定字幕行（含不存在的行 → 400）
+   * 返回 rows（逐行缺失）与扁平 items：{lang, subtitle_id, idx, source_term, target_term}。
+   */
+  app.post('/api/projects/:id/glossary/:lang/check', (req, res) => {
+    const p = getProject(req, res);
+    if (!p) return;
+    const lang = getLang(req, res);
+    if (!lang) return;
+    const b = req.body || {};
+
+    let idFilter = null;
+    if (b.subtitle_ids !== undefined) {
+      if (!Array.isArray(b.subtitle_ids) ||
+          b.subtitle_ids.some((x) => !Number.isInteger(x) || x < 1)) {
+        return res.status(400).json({
+          error: '请求非法',
+          errors: ['subtitle_ids 必须是 ≥1 的整数数组（字幕 ID），或省略以核对全部行'],
+        });
+      }
+      const cueIds = new Set(p.subtitles.map((c) => c.id));
+      const unknown = [...new Set(b.subtitle_ids)].filter((sid) => !cueIds.has(sid));
+      if (unknown.length > 0) {
+        return res.status(400).json({
+          error: '请求非法',
+          errors: unknown.map(
+            (sid) => `字幕 ${sid} 在当前字幕集（v${p.sub_version}）中不存在（可能已被重排删除）`
+          ),
+        });
+      }
+      idFilter = new Set(b.subtitle_ids);
+    }
+
+    const result = glossary.evaluateGlossary(db, p.id, lang, { subtitleIds: idFilter });
+    res.json({
+      project_id: p.id,
+      lang: result.lang,
+      configured: result.configured,
+      term_version: result.term_version,
+      cue_count: result.cue_count,
+      checked_count: result.checked_count,
+      missing_count: result.missing_count,
+      rows: result.rows,
+      items: result.items,
+    });
   });
 
   return app;

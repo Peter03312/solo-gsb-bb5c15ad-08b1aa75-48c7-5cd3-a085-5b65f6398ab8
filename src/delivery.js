@@ -26,6 +26,7 @@
 
 const { validateStructure, validateRules } = require('./layout');
 const { normalizeLang, checkTranslationText } = require('./translation');
+const { listTermsByLang, checkEntries, getTermVersion } = require('./glossary');
 
 function isInt(v) {
   return typeof v === 'number' && Number.isInteger(v);
@@ -144,11 +145,11 @@ function parseDeliveryBody(body) {
  * activeByLang：Map(lang -> Map(subtitle_id -> translationRow))，各语言非历史译文
  *
  * 返回：
- *   { sub_version_stale, rules_version_stale, conflicts,
- *     languages: [{ lang, missing:[], review:[], invalid:[], version_stale:[], problem_count }] }
- * 行级原因按语言和字幕行给出；problem_count 为该语言四种问题的总数。
+ *   { sub_version_stale, rules_version_stale, conflicts, term_version,
+ *     languages: [{ lang, missing:[], review:[], invalid:[], terminology:[], version_stale:[], problem_count }] }
+ * 行级原因按语言和字幕行给出；problem_count 为该语言五种问题的总数。
  */
-function evaluateDelivery(project, request, activeByLang) {
+function evaluateDelivery(db, project, request, activeByLang) {
   const conflicts = [
     ...validateStructure(project.subtitles, project.words, project.cuts),
     ...validateRules(project.subtitles, project.rules),
@@ -221,10 +222,27 @@ function evaluateDelivery(project, request, activeByLang) {
       }
     }
 
+    // 术语核对（事务内读取当前术语）：只核对 current 且版本一致的行（其他问题已在上面分桶）。
+    // 未配置术语的语言 terms 为空 → terminology 恒为空，不受影响。
+    const terms = listTermsByLang(db, project.id, lang);
+    const termEntries = project.subtitles
+      .map((cue) => {
+        const submittedVersion = submitted.get(cue.id);
+        const row = byCue.get(cue.id);
+        if (!row || submittedVersion === undefined || row.version !== submittedVersion ||
+            row.status !== 'current') {
+          return null;
+        }
+        return { cue, translation: row };
+      })
+      .filter(Boolean);
+    const terminology = checkEntries(termEntries, terms);
+
     return {
       lang,
-      missing, review, invalid, version_stale: versionStale,
-      problem_count: missing.length + review.length + invalid.length + versionStale.length,
+      missing, review, invalid, terminology, version_stale: versionStale,
+      problem_count: missing.length + review.length + invalid.length +
+        versionStale.length + terminology.length,
     };
   });
 
@@ -233,6 +251,7 @@ function evaluateDelivery(project, request, activeByLang) {
     rules_version_stale: request.rules_version !== project.rules.version,
     sub_version_current: project.sub_version,
     rules_version_current: project.rules.version,
+    term_version: getTermVersion(db, project.id),
     conflicts,
     languages,
   };

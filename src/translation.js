@@ -185,18 +185,27 @@ function buildLangView(db, projectId, lang) {
   ).all(projectId);
   const byCue = activeTranslationsByLang(db, projectId, lang);
 
+  // 当前语言术语表：术语只参与核对，不改变译文 current/review 状态
+  const glossary = require('./glossary');
+  const terms = glossary.listTermsByLang(db, projectId, lang);
+  const termVersion = glossary.getTermVersion(db, projectId);
+
   const entries = cues.map((cue) => {
     const row = byCue.get(cue.id);
     const translation = row ? mapRow(row) : null;
     let state = 'missing';
     let valid = false;
     let invalidReasons = [];
+    let termMissing = [];
     if (row) {
       state = row.status === 'review' ? 'review' : 'current';
       invalidReasons = checkTranslationText(row.text, cue, rules);
+      termMissing = glossary.findMissingTerms(cue.text, row.text, terms);
+      // valid 只反映状态与字数/字速规则（与既有约定保持一致）；
+      // 术语缺失单独以 term_missing 暴露，供查询与导出核对。
       valid = state === 'current' && invalidReasons.length === 0;
     }
-    return { cue, translation, state, valid, invalid_reasons: invalidReasons };
+    return { cue, translation, state, valid, invalid_reasons: invalidReasons, term_missing: termMissing };
   });
 
   const counts = {
@@ -207,15 +216,22 @@ function buildLangView(db, projectId, lang) {
     counts[e.state]++;
     if (e.valid) counts.valid++;
   }
+  const termMissingCount = entries.reduce((n, e) => n + e.term_missing.length, 0);
   return {
     lang,
     sub_version: project.sub_version,
     rules_version: rules.version,
     rules,
     counts,
+    glossary: {
+      configured: terms.length > 0,
+      term_version: termVersion,
+      term_count: terms.length,
+      missing_count: termMissingCount,
+    },
     entries,
     exports: db.prepare(
-      'SELECT lang, version, cue_count, created_at FROM translation_exports WHERE project_id = ? AND lang = ? ORDER BY version DESC'
+      'SELECT lang, version, cue_count, term_version, created_at FROM translation_exports WHERE project_id = ? AND lang = ? ORDER BY version DESC'
     ).all(projectId, lang),
     history: listHistory(db, projectId, lang),
   };
@@ -223,6 +239,7 @@ function buildLangView(db, projectId, lang) {
 
 /**
  * 项目语言总览：每种语言的译文状态分布 + 导出数（含历史条数）。
+ * 附该语言已配置的术语条数（未配置术语的语言不受术语核对影响）。
  */
 function listLanguages(db, projectId) {
   const rows = db.prepare(
@@ -237,6 +254,11 @@ function listLanguages(db, projectId) {
     'SELECT lang, COUNT(*) AS n FROM translation_exports WHERE project_id = ? GROUP BY lang'
   ).all(projectId);
   const expByLang = new Map(exportCounts.map((r) => [r.lang, r.n]));
+  const termCounts = db.prepare(
+    'SELECT lang, COUNT(*) AS n FROM glossary_terms WHERE project_id = ? GROUP BY lang'
+  ).all(projectId);
+  const termsByLang = new Map(termCounts.map((r) => [r.lang, r.n]));
+  const termVersion = db.prepare('SELECT term_version FROM projects WHERE id = ?').get(projectId).term_version;
   return rows.map((r) => ({
     lang: r.lang,
     active_count: r.active_count,
@@ -244,6 +266,8 @@ function listLanguages(db, projectId) {
     review_count: r.review_count,
     history_count: r.history_count,
     export_count: expByLang.get(r.lang) || 0,
+    term_count: termsByLang.get(r.lang) || 0,
+    term_version: termVersion,
   }));
 }
 
@@ -288,15 +312,23 @@ function evaluateExport(db, projectId, lang) {
     }
   }
 
+  // 术语核对（同一事务内读取当前术语）：每行命中的源词，其规定译法都必须出现在译文中。
+  // 未配置术语的语言 terms 为空 → terminology 恒为空，不受影响。
+  const glossary = require('./glossary');
+  const terms = glossary.listTermsByLang(db, projectId, lang);
+  const terminology = glossary.checkEntries(view.entries, terms);
+  const termVersion = glossary.getTermVersion(db, projectId);
+
   const ok = conflicts.length === 0 && missing.length === 0 &&
-    review.length === 0 && invalid.length === 0;
+    review.length === 0 && invalid.length === 0 && terminology.length === 0;
   return {
     ok, lang,
     sub_version: project.sub_version,
     rules_version: view.rules_version,
+    term_version: termVersion,
     counts: view.counts,
     entries: view.entries,
-    missing, review, invalid, conflicts,
+    missing, review, invalid, terminology, conflicts,
   };
 }
 
