@@ -862,6 +862,7 @@ async function loadTranslation(lang) {
   state.trView = body;
   $('#tr-lang').value = lang;
   renderTranslations();
+  loadGlossary();
 }
 
 function trStateTag(stateName, valid) {
@@ -880,7 +881,13 @@ function renderTranslations() {
   $('#tr-lang-tag').textContent = view.lang;
   const c = view.counts;
   $('#tr-stats').textContent =
-    `共 ${c.cues} 条 · 当前 ${c.current}（有效 ${c.valid}）· 待复核 ${c.review} · 缺译 ${c.missing} · 历史 ${view.history.length}`;
+    `共 ${c.cues} 条 · 当前 ${c.current}（有效 ${c.valid}）· 待复核 ${c.review} · 缺译 ${c.missing} · 历史 ${view.history.length}` +
+    (c.term_missing ? ` · 术语缺失 ${c.term_missing} 行` : '');
+  const glTag = $('#gl-version');
+  if (glTag) {
+    const g = view.glossary || { configured: false, version: 0 };
+    glTag.textContent = g.configured ? `术语 v${g.version}` : '术语未配置 v0';
+  }
 
   const box = $('#tr-table');
   box.innerHTML = '';
@@ -927,6 +934,10 @@ function renderTranslations() {
       (e.translation ? ` <span class="hint">译文 v${e.translation.version}</span>` : '');
     for (const reason of e.invalid_reasons) {
       tagLine.innerHTML += `<div class="tr-reason">• ${escapeHtml(reason)}</div>`;
+    }
+    for (const issue of (e.term_issues || [])) {
+      tagLine.innerHTML +=
+        `<div class="tr-reason term">📖 ${escapeHtml(issue.source)} → ${escapeHtml(issue.target)}</div>`;
     }
     wrap.append(input, meta, tagLine);
 
@@ -1047,6 +1058,10 @@ async function exportTranslation() {
     if (body.missing?.length) parts.push(`缺译 ${body.missing.length} 条：${body.missing.slice(0, 4).map((m) => `#${m.subtitle_id}`).join('、')}`);
     if (body.review?.length) parts.push(`待复核 ${body.review.length} 条`);
     if (body.invalid?.length) parts.push(`规则不通过 ${body.invalid.length} 条`);
+    if (body.term_missing?.length) {
+      parts.push(`术语缺失 ${body.term_missing.length} 条：${body.term_missing.slice(0, 3)
+        .flatMap((m) => m.missing.map((x) => `${x.source}→${x.target}`)).join('、')}`);
+    }
     if (body.conflicts?.length) parts.push(`整版冲突 ${body.conflicts.length} 处：${body.conflicts.slice(0, 2).map((c) => c.message).join('｜')}`);
     toast(body.error + (parts.length ? '：' + parts.join('；') : ''), true);
     await loadTranslation(lang);
@@ -1057,6 +1072,99 @@ async function exportTranslation() {
     toast(body?.error || '导出失败', true);
     if (status === 400) { /* 语言代号非法，不切换面板 */ }
   }
+}
+
+// ---------- 译审术语对照表（随当前译文语言读取/保存） ----------
+
+async function glossaryLang() {
+  const lang = state.trLang || $('#tr-lang').value.trim();
+  if (!lang) toast('请先填写目标语言代号并「载入语言」', true);
+  return lang;
+}
+
+async function loadGlossary() {
+  const p = state.project;
+  const lang = await glossaryLang();
+  if (!lang) return;
+  const { status, body } = await api(`/api/projects/${p.id}/glossaries/${encodeURIComponent(lang)}`);
+  if (status !== 200) return toast(body?.error || '载入术语表失败', true);
+  state.glossary = body;
+  $('#gl-terms').value = body.terms.length ? JSON.stringify(body.terms, null, 2) : '[]';
+  $('#gl-version').textContent = body.configured ? `术语 v${body.version}` : '术语未配置 v0';
+  renderGlossaryMissing([]);
+}
+
+async function saveGlossary() {
+  const p = state.project;
+  const lang = await glossaryLang();
+  if (!lang) return;
+  let terms;
+  try {
+    terms = JSON.parse($('#gl-terms').value || '[]');
+  } catch {
+    return toast('术语 JSON 解析失败：须为 [{source,target}] 数组', true);
+  }
+  const base = state.glossary && state.glossary.lang === lang
+    ? state.glossary.version
+    : (await api(`/api/projects/${p.id}/glossaries/${encodeURIComponent(lang)}`)).body.version;
+  const { status, body } = await api(
+    `/api/projects/${p.id}/glossaries/${encodeURIComponent(lang)}`,
+    { method: 'PUT', body: JSON.stringify({ version: base, terms }) }
+  );
+  if (status === 200) {
+    state.glossary = body;
+    $('#gl-terms').value = JSON.stringify(body.terms, null, 2);
+    $('#gl-version').textContent = `术语 v${body.version}`;
+    toast(`✓ ${lang} 术语表已保存（${body.term_count} 条，v${body.version}）；不改变既有译文状态`);
+    await loadTranslation(lang);
+  } else if (status === 409) {
+    state.glossary = body.current;
+    $('#gl-version').textContent = body.current.configured ? `术语 v${body.current.version}` : '术语未配置 v0';
+    $('#gl-terms').value = JSON.stringify(body.current.terms, null, 2);
+    toast(body.error + '，已载入当前表', true);
+  } else {
+    toast((body?.errors || [body?.error || '保存失败']).join('；'), true);
+  }
+}
+
+function renderGlossaryMissing(rows) {
+  const box = $('#gl-missing');
+  box.innerHTML = '';
+  if (!rows.length) {
+    box.innerHTML = '<div class="empty">当前无术语缺失。</div>';
+    return;
+  }
+  const ul = document.createElement('ul');
+  ul.className = 'gl-missing-list';
+  for (const r of rows) {
+    const li = document.createElement('li');
+    li.innerHTML =
+      `<div><strong>#${r.subtitle_id}</strong> ${escapeHtml(r.source_text)}</div>` +
+      r.missing.map((m) =>
+        `<div class="tr-reason term">📖 ${escapeHtml(m.source)} → ${escapeHtml(m.target)}</div>`
+      ).join('');
+    ul.appendChild(li);
+  }
+  box.appendChild(ul);
+}
+
+async function queryGlossaryMissing() {
+  const p = state.project;
+  const lang = await glossaryLang();
+  if (!lang) return;
+  const { status, body } = await api(
+    `/api/projects/${p.id}/glossaries/${encodeURIComponent(lang)}/missing`
+  );
+  if (status !== 200) return toast(body?.error || '查询失败', true);
+  if (!body.configured) {
+    $('#gl-version').textContent = '术语未配置 v0';
+    return renderGlossaryMissing([]);
+  }
+  $('#gl-version').textContent = `术语 v${body.glossary_version}`;
+  renderGlossaryMissing(body.missing);
+  toast(body.missing.length
+    ? `术语缺失 ${body.missing.length} 行（术语 v${body.glossary_version}）`
+    : `✓ 术语全部命中（v${body.glossary_version}）`);
 }
 
 // ---------- 示例数据 ----------
@@ -1113,6 +1221,9 @@ $('#tr-lang').addEventListener('keydown', (e) => {
   if (e.key === 'Enter') { e.preventDefault(); $('#btn-tr-load').click(); }
 });
 $('#btn-tr-export').addEventListener('click', exportTranslation);
+$('#btn-gl-load').addEventListener('click', loadGlossary);
+$('#btn-gl-save').addEventListener('click', saveGlossary);
+$('#btn-gl-missing').addEventListener('click', queryGlossaryMissing);
 
 loadProjects();
 

@@ -108,6 +108,17 @@
         </div>
         <ul id="tr-export-list" class="export-list"></ul>
         <p class="hint">导出前须当前每行都有<strong>有效当前译文</strong>且整版符合时间与切点约束，否则列出缺漏/冲突且不生成快照；已导出快照不可变。</p>
+        <div class="glossary-box">
+          <h3>📖 译审术语对照表 <span id="gl-version" class="tag"></span></h3>
+          <p class="hint">整表替换「源词 → 规定译法」，保存自动携带当前术语版本（未配置为 v0）。原文字幕<strong>精确命中</strong>源词时译文须包含规定译法（一行多词全部满足）；缺术语<strong>不阻止保存</strong>，但会阻止该语言导出/交付/译文署名导出，且不改变译文 current/review 状态。</p>
+          <textarea id="gl-terms" rows="4" spellcheck="false" placeholder='[{"source":"你好","target":"Hello"}]'></textarea>
+          <div class="row buttons">
+            <button id="btn-gl-load" class="secondary">载入当前表</button>
+            <button id="btn-gl-save" class="primary">保存术语表</button>
+            <button id="btn-gl-missing" class="secondary">查询缺失</button>
+          </div>
+          <div id="gl-missing" class="gl-missing"></div>
+        </div>
       </section>
       <section class="panel">
         <h2>⑧ 说话人标注与署名版导出 <span id="sp-version" class="tag"></span></h2>

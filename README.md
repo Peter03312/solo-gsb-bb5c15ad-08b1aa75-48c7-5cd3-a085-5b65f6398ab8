@@ -18,6 +18,7 @@
 - **片方多语字幕交付（批次冻结）**：一次提交把**原文与选定的多种语言冻结为同一时间轴的一个批次**。请求携带当前字幕集版本 `sub_version`、规则版本 `rules_version`、**非空且不重复**的目标语言列表，以及各语言**逐行译文版本**清单。服务端在**同一个事务内**核对：提交版本仍有效（字幕集/规则漂移 → `409`）、源字幕整版结构（词覆盖/不重叠/不跨切点/不缩短词时段）与现行规则通过、每种语言每行译文均为 `current` 且满足字数/字速、译文版本与提交一致；任一语言**缺译/待复核/无效/版本漂移**都按语言和字幕行返回原因，**整批不生成快照、不消耗版本**。成功时在现有**原文导出序列与各语言导出序列**中各生成一个不可变 WebVTT 版本（因此文件直接经现有下载接口取得），并以**批次清单**关联文件、字幕集版本与规则版本；各文件时间轴完全一致，后续编辑不改变旧批次。既有原文导出、单语言导出及下载约定保持兼容。
 - **译者整批译文回填（本轮新增）**：译者完成整批译文后，可按**一种目标语言**把整批译文回填到当前字幕。提交**批次编号** `batch_no`、读取时字幕集版本 `sub_version`、规则版本 `rules_version` 与**非空逐行清单**（字幕 ID、源行版本 `cue_version`、译文版本 `version`（新建 `0`/省略）、非空文本）。按字幕 ID 对齐，允许覆盖**待复核**译文；**同批重复 ID、无效语言、不存在的字幕**一律拒绝。提交时在事务内重新核对版本、源行及当前**字数/字速**规则：任一行过期（字幕集/规则/源行/译文版本）或违规，**按行返回当前值与原因，整批不写入**。通过后在**同一事务**保存全部译文——新建版本从 `1` 开始，更新版本递增并把源快照刷新为 `current`；**未列出的行与其他语言不变**，且回填只写译文、不推进 `sub_version`。**同项目同语言批次编号重复且内容相同**（内容指纹对清单按字幕 ID 排序，提交顺序不影响判定）→ 返回首次结果（`200 replayed`）而不再次写入；**编号相同但内容不同** → `409` 冲突；**失败批次不占编号**。回填结果就是普通译文，逐行译文操作、单语言导出与多语交付继续读取，**旧导出快照保持不变**。
 - **说话人标注与署名版导出（本轮新增）**：项目内维护**说话人编号（服务端分配、不回收、不可变）→ 显示名**，显示名可修改，**改名推进归属版本** `attribution_version`（归属标注写入同样推进）。归属**按字幕 ID 锚定**：提交按字幕 ID 携带读取时**行版本** `cue_version` 与**归属版本**，`speaker_number` 必须存在；过期返回当前值，**锁定行也可标注**（单行或整批，整批任一过期/编号缺失则整批不写入）。**重排保留 ID 的行归属继续有效**（仅顺序变化或原地更新都不失效）；**原行删除后归属留作历史，新行待标注，绝不按展示序号转移**。署名版导出携带**字幕集版本与归属版本**，在**同一事务**内核对每条当前字幕均有有效归属（说话人仍在名册、显示名可安全写入标签）；可选择**原文**或**一种目标语言**，选择译文时携带**逐行译文版本**清单，译文须逐行 `current`、版本未变且满足现行字数/字速，否则**按行列原因且不生成快照**。署名版正文按 WebVTT 语法写**说话人标签** `<v 显示名>文本</v>`，并**拒绝含换行或标签界定符（`<`、`>`）的显示名**；**原文与译文共用同一时间轴**。**普通导出及旧下载内容保持兼容（不含标签）**，署名版**另存**为可查询、可下载的**不可变快照**（改名、改归属、改字幕都不影响旧快照）。
+- **译审术语对照表（本轮新增）**：译审按**目标语言**维护「源词 → 规定译法」对照表，**整表修改**（整体替换词条）并携带读取时**术语版本**（未配置传 `0`），过期返回 `409` 与当前表；词与译法均为**非空文本**（无首尾空白、≤100 字），**同一语言源词不得重复**，允许提交空数组清空该语言术语。按**当前原文字幕文本精确匹配**源词（字面子串）：每条命中源词的译文都**必须包含对应规定译法**，**一行命中多词时每个规定译法都须满足**；**未配置术语的语言完全不受影响**。另有只读缺失查询，按**语言、字幕 ID 与源词**逐条列出缺失译法并附当前术语版本（无译文行也列出）。**译文即使缺失规定译法仍可保存供修正**（保存响应与并列视图附 `term_issues`），**术语变更不改变既有译文的 current/review 状态**。**单语言译文导出、多语言同版交付与译文署名版导出**在**原有事务内读取当前术语**并核对：任一缺失逐行（多语交付按语言+行，署名导出行内带 `translation_term_missing`）报错且**不生成快照、不消耗版本**；**原文导出、现有译文读写约定与旧导出快照保持兼容**（术语收紧后旧快照仍可下载且内容不变）。
 
 ## 启动
 
@@ -69,6 +70,7 @@ Compose 默认把 SQLite 挂到命名卷 `subtitle-data` 持久化（含所有�
 9. **片方交付批次**：各语言译文都 current 且有效后，按 `POST /api/projects/:id/deliveries` 提交 `{sub_version, rules_version, languages, translations:{lang:[{subtitle_id, version}]}}`，服务端事务内整版核对，通过即把原文与各语言冻结为同一时间轴的一个批次（各序列生成不可变 WebVTT，文件走既有下载接口）；失败按语言和字幕行返回原因且不生成快照、不耗版本。清单用 `GET /api/projects/:id/deliveries` 查询。HTTP 流程见 `examples/deliveries-api.sh`。
 10. **译者整批译文回填（本轮新增）**：整批译文完成后，按 `POST /api/projects/:id/translations/:lang/batches` 一次提交一种语言，携带 `batch_no`、`sub_version`、`rules_version` 与逐行 `items:[{subtitle_id, cue_version, version, text}]`（新建 `version=0`）；同批重复 ID/无效语言/不存在字幕 → `400`，版本过期 → `409`，超字数/字速 → `422`，均按行返回当前值与原因且整批不写入；成功后新建从 v1、更新版本 +1（可覆盖待复核）。同编号同内容重放返回首次结果（`200 replayed`），同编号不同内容 `409` 冲突，失败不占编号。回填结果直接被并列查询、单语言导出与多语交付读取。HTTP 流程见 `examples/translation-batches-api.sh`。
 11. **说话人标注与署名版导出（本轮新增）**：在左侧 ⑧ 面板「新建说话人」建立编号→显示名，「载入归属」后逐行选择说话人并保存（锁定行也可标注）；改显示名用「改名」（推进归属版本）。点「署名版导出（原文）」或「署名版导出（当前译文语言）」生成带 `<v 名称>` 标签的不可变 WebVTT；逐行缺归属/译文问题会在提示中按行列出且不生成快照。也可走 HTTP（见下节与 `examples/speakers-api.sh`）。
+12. **译审术语对照表（本轮新增）**：通过 HTTP 维护（见「译审术语对照表」一节与 `examples/glossaries-api.sh`）：`PUT …/glossaries/:lang` 整表提交 `{version, terms:[{source,target}]}`（未配置传 `version:0`）；保存译文或并列查询会显示每行 `term_issues`，`GET …/glossaries/:lang/missing` 按语言/字幕 ID/源词列出缺失；单语言导出、多语交付与译文署名导出在原事务内按当前术语核对，缺失逐行报错且不生成快照；术语变更不改译文状态、不影响旧快照。
 
 ## API 摘要
 
@@ -117,6 +119,10 @@ Compose 默认把 SQLite 挂到命名卷 `subtitle-data` 持久化（含所有�
 | `POST` | `/api/projects/:id/attributed-exports` | **署名版导出**：`{sub_version, attribution_version, lang?, translations?:[{subtitle_id, version}]}`；不带 `lang` 为原文，带 `lang` 为一种译文；同一事务核对每行有效归属（译文另逐行核对版本/状态/规则），失败 `422` 按行列 `codes`/`reasons` 且不生成快照，版本漂移 → `409`；成功另存带 `<v 显示名>` 标签的不可变快照 |
 | `GET` | `/api/projects/:id/attributed-exports` | 署名版快照清单（原文/译文同一连续序列，倒序，含字幕集/归属/规则版本） |
 | `GET` | `/api/projects/:id/attributed-exports/:version` | 下载某版本署名版 `.vtt`（内容创建后不变） |
+| `GET` | `/api/projects/:id/glossaries` | 译审术语表总览：各语言术语版本与词条数 |
+| `GET` | `/api/projects/:id/glossaries/:lang` | 读取某语言当前术语表（未配置返回 `configured:false`、`version:0`、空词条） |
+| `PUT` | `/api/projects/:id/glossaries/:lang` | **整表修改术语**：`{version, terms:[{source,target}]}`；未配置 `version:0`，过期 → `409`（带 `current` 当前表）；空词/空译法/同源词重复 → `400`；允许空数组清空 |
+| `GET` | `/api/projects/:id/glossaries/:lang/missing` | **术语缺失查询**：按语言/字幕 ID/源词逐条列出缺失规定译法（含无译文行）与当前 `glossary_version` |
 
 修订请求与核对说明：
 
@@ -385,12 +391,46 @@ WEBVTT
 
 完整 curl 示例：`examples/speakers-api.sh`（名册→单行/批量标注→过期与编号错误→锁定行标注→重排身份保持→原文署名导出→改名与快照不可变→译文署名导出及逐行版本漂移→清单/下载→普通导出兼容）。浏览器内使用左侧 ⑧ 面板。
 
+## 译审术语对照表（源词 → 规定译法；查询提示，导出拦截）
+
+译审为项目的每个目标语言维护一张**整表版本化**的术语对照表。术语只约束**译文内容是否包含规定译法**，不改动原文、时间轴或译文状态机：
+
+- **表结构与版本**：每项目每语言至多一张表（`glossaries`），词条为 `{source 源词, target 规定译法}`。修改是**整表替换**（提交内容即修改后的完整词条），必须携带读取时**术语版本** `version`：该语言从未配置时传 `0`（创建后版本为 1）；之后每次修改版本 `+1`，过期提交返回 `409` 与 `current` 当前表。
+- **词条约束**：`source`/`target` 均为**非空文本**，不允许首尾空白、长度 ≤100 字；**同一语言术语表内源词不得重复**（整批内唯一，由数据库唯一索引兜底）；允许提交**空词条数组**（清空该语言术语，表与版本保留）。未配置术语（或词条为空）的语言**不受任何影响**。
+- **精确匹配规则**：以**当前原文字幕文本**对源词做字面子串精确匹配（大小写敏感、不做分词）；每条命中源词的译文都必须**包含对应规定译法**（同样为子串匹配），**一行命中多个源词时每个规定译法都必须出现**。例：原文「你好世界」配置 `你好→Hello`、`世界→world` 时，译文 `Hello world`、`world, Hello!` 均合规，`Hello there` 缺 `world`。
+- **保存不拦截、状态不联动**：译文即使缺失规定译法也可以正常 `PUT`/整批回填保存（供译者随后修正），保存响应与单语言并列查询在每行附 `term_issues`（逐条 `{source,target,reason}`）；**术语新增/修改/清空绝不改变既有译文的 `current`/`review` 状态**，也不影响确认、锁定、重排等既有约定。
+- **缺失查询**：`GET …/glossaries/:lang/missing` 只读，按**语言、字幕 ID 与源词**逐条列出当前缺失（无译文的行同样列出），并给当前 `glossary_version`，供译者逐行补译后复查。
+
+### 导出闸门（在原有事务内读取当前术语）
+
+以下三类导出/交付保持原有事务与乐观锁不变，在**同一事务内读取当前术语表**并追加术语核对；任一缺失都**逐行报错且不生成快照、不占用任何序列版本号**：
+
+1. **单语言译文导出** `POST …/translations/:lang/exports`：失败 `422` 新增 `term_missing[]`（每行附命中源词、缺失术语、当前译文与逐条原因）与 `glossary_version`；成功响应同样带 `glossary_version`。
+2. **多语言同版交付** `POST …/deliveries`：每种语言结果新增 `term_missing[]` 与 `glossary_version`；任一语言任一行缺术语，整批回滚（原文/译文快照均不生成）。
+3. **译文署名版导出** `POST …/attributed-exports`（带 `lang`）：问题行 `codes` 增加 `translation_term_missing` 并附 `term_missing[]`，响应带 `glossary_version`；**原文署名导出不做术语核对**。
+
+术语闸门只作用于“其余条件已满足”的行（已有 `current`、版本一致、字数/字速合规），避免与 `missing`/`review`/`invalid`/`version_stale` 重复报错；这些问题修正后再次导出时会按**当时**的术语重新核对。**原文导出 `POST …/exports` 完全不涉及术语；既有译文读写接口形状与语义不变；已生成的一切快照（原文/译文/署名版/交付批次文件）不可变，术语随后收紧也不影响旧文件下载。**
+
+### API 流程
+
+1. 读取：`GET …/glossaries`（总览）、`GET …/glossaries/en`（单语言，含 `version`/`terms`）。
+2. 建表/修改：`PUT …/glossaries/en`
+   ```json
+   {"version": 0, "terms": [{"source": "你好", "target": "Hello"}]}
+   ```
+   - `200` 返回修改后的表（`version`/`term_count`/`terms`）；`400` 形状非法（附逐项 `errors`，不修改）；`409` 术语版本过期（`current` 为当前表）。
+3. 保存译文时查看响应 `term_issues`，或用 `GET …/translations/en` 的逐行 `term_issues` / `counts.term_missing`。
+4. 缺失查询：`GET …/glossaries/en/missing` → `{glossary_version, missing:[{subtitle_id, idx, source_text, matched:[...], missing:[{source,target,reason}]}]}`。
+5. 照常调用三类导出；术语缺失时按行修正译文后重试（术语版本无需调用方传入——导出始终在事务内读取当前版本）。
+
+完整 curl 示例：`examples/glossaries-api.sh`（建表/非法与过期示例→缺术语译文可保存→缺失查询→单语言导出拦截→术语收紧不改状态与旧快照→多语交付整批拦截与成功→译文署名导出拦截/原文署名不受影响）。
+
 
 ## 目录结构
 
 ```
 server.js            入口：初始化 SQLite、播种演示数据、启动 HTTP
-src/db.js            连接与建表（projects/words/shots/rules/subtitles/exports/revisions/revision_items/word_revisions/word_revision_items/translations/translation_exports/delivery_batches/delivery_files/translation_batches/translation_batch_items/speakers/attributions/attributed_exports；旧库迁移补 attribution_version）
+src/db.js            连接与建表（projects/words/shots/rules/subtitles/exports/revisions/revision_items/word_revisions/word_revision_items/translations/translation_exports/delivery_batches/delivery_files/translation_batches/translation_batch_items/speakers/attributions/attributed_exports/glossaries/glossary_terms；旧库迁移补 attribution_version）
 src/layout.js        排版引擎（纯函数）：切点分析 → 分段 → 定时 → 结构自检
 src/validate.js      导入与编辑校验
 src/revision.js      批量字幕修订提议：请求解析 + 整组候选核对（词区间/时间/切点/相邻/规则/版本）
@@ -399,6 +439,7 @@ src/translation.js   多语言译文字幕：解析/规则校验/并列视图/�
 src/translation-batch.js 译者整批译文回填：请求解析/内容指纹/事务内逐行版本与规则核对/幂等与批次清单
 src/delivery.js      片方多语交付批次：请求解析 + 事务内整版/逐语言逐行核对 + 批次清单视图
 src/speaker.js       说话人标注：名册/显示名校验/归属批量与单行乐观锁核对/删除行历史对账/署名版导出事务核对
+src/glossary.js      译审术语表：整表替换与乐观锁/词条校验（非空/同语言源词唯一）/源词精确匹配核对/缺失查询与导出/交付/署名导出的术语闸门
 src/vtt.js           WebVTT 序列化（普通正文与署名版 <v 显示名> 说话人标签，原文与译文共用）
 src/routes.js        Express API
 public/              前端（原生 HTML/CSS/JS 单页，含字幕修订、逐词修正、多语言译文与说话人标注面板）
@@ -409,6 +450,7 @@ examples/translations-api.sh 多语言译文字幕（保存→查询→失效/�
 examples/translation-batches-api.sh 译者整批译文回填（整批写入→幂等/冲突→过期/违规→覆盖待复核→下游读取）的完整 curl 调用示例
 examples/deliveries-api.sh 片方多语交付批次（核对→整批冻结→清单查询→既有接口下载）的完整 curl 调用示例
 examples/speakers-api.sh 说话人标注与署名版导出（名册→归属→重排身份保持→原文/译文署名快照→兼容普通导出）的完整 curl 调用示例
-test/                node:test 单元 + API 集成测试（revision / word-revision / translation / translation-batch / delivery / speaker 覆盖六类流程）
+examples/glossaries-api.sh 译审术语对照表（建表/乐观锁→缺失查询→单语言导出/多语交付/译文署名导出三类闸门→旧快照兼容）的完整 curl 调用示例
+test/                node:test 单元 + API 集成测试（revision / word-revision / translation / translation-batch / delivery / speaker / glossary 覆盖七类流程）
 Dockerfile / docker-compose.yml
 ```

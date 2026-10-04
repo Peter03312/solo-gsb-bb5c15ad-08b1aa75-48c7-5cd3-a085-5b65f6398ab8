@@ -26,6 +26,7 @@
 
 const { validateStructure, validateRules } = require('./layout');
 const { normalizeLang, checkTranslationText } = require('./translation');
+const { evaluateTerms } = require('./glossary');
 
 function isInt(v) {
   return typeof v === 'number' && Number.isInteger(v);
@@ -142,13 +143,16 @@ function parseDeliveryBody(body) {
  * project：loadProject 结果（含 sub_version/rules/words/cuts/subtitles）
  * request：parseDeliveryBody 通过后的 request
  * activeByLang：Map(lang -> Map(subtitle_id -> translationRow))，各语言非历史译文
+ * glossaryByLang：可选，Map(lang -> getGlossary 结果)；术语核对按各语言当前术语表进行，
+ *                 未配置术语的语言 term_missing 恒为空（不受影响）。
  *
  * 返回：
  *   { sub_version_stale, rules_version_stale, conflicts,
- *     languages: [{ lang, missing:[], review:[], invalid:[], version_stale:[], problem_count }] }
- * 行级原因按语言和字幕行给出；problem_count 为该语言四种问题的总数。
+ *     languages: [{ lang, missing:[], review:[], invalid:[], version_stale:[],
+ *                   term_missing:[], glossary_version, problem_count }] }
+ * 行级原因按语言和字幕行给出；problem_count 为该语言五类问题的总数。
  */
-function evaluateDelivery(project, request, activeByLang) {
+function evaluateDelivery(project, request, activeByLang, glossaryByLang) {
   const conflicts = [
     ...validateStructure(project.subtitles, project.words, project.cuts),
     ...validateRules(project.subtitles, project.rules),
@@ -165,6 +169,7 @@ function evaluateDelivery(project, request, activeByLang) {
     const review = [];    // 译文待复核
     const invalid = [];   // current 但不满足现行字数/字速
     const versionStale = []; // 译文存在但版本与提交不一致（版本漂移）
+    const termEligible = []; // 其余条件已满足、须再做术语核对的字幕行
 
     const addProblem = (bucket, cue, reasons, extra) => {
       bucket.push({
@@ -218,13 +223,34 @@ function evaluateDelivery(project, request, activeByLang) {
         addProblem(invalid, cue, ruleReasons, {
           current: { version: row.version, text: row.text },
         });
+        continue;
       }
+      // 其余条件已满足：加入术语核对候选
+      termEligible.push(cue);
     }
+
+    // 术语核对（未配置术语的语言直接为空；与缺译/待复核/无效/版本漂移不重复报错）
+    const glossary = (glossaryByLang && glossaryByLang.get(lang)) || null;
+    const termEval = evaluateTerms(
+      termEligible, byCue, glossary, new Set(termEligible.map((c) => c.id))
+    );
+    const termMissing = termEval.rows.map((r) => ({
+      subtitle_id: r.subtitle_id,
+      idx: r.idx,
+      text: r.source_text,
+      missing: r.missing,
+      current: r.translation
+        ? { version: r.translation.version, text: r.translation.text }
+        : null,
+    }));
 
     return {
       lang,
-      missing, review, invalid, version_stale: versionStale,
-      problem_count: missing.length + review.length + invalid.length + versionStale.length,
+      missing, review, invalid, version_stale: versionStale, term_missing: termMissing,
+      glossary_version: glossary ? glossary.version : 0,
+      problem_count:
+        missing.length + review.length + invalid.length +
+        versionStale.length + termMissing.length,
     };
   });
 

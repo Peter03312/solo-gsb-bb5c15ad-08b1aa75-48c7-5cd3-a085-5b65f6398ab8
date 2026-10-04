@@ -171,8 +171,13 @@ function listHistory(db, projectId, lang) {
  *   state        missing | current | review
  *   valid        是否可参与导出（current 且满足现行字数/字速规则）
  *   invalid_reasons []  现行规则不通过的中文原因（review 也会动态计算）
+ *   term_issues  []  当前术语表下该译文缺失的规定译法（逐条带 source/target/reason）；
+ *                 未配置术语的语言恒为空数组；无译文行也列出命中源词（供专用查询接口外
+ *                 的并列视图直接看到缺译点）。术语问题不影响 state/valid（术语变更不改变
+ *                 current/review 状态，译文不合术语仍可保存）。
  */
 function buildLangView(db, projectId, lang) {
+  const glossaryMod = require('./glossary');
   const project = db.prepare('SELECT sub_version FROM projects WHERE id = ?').get(projectId);
   const rulesRow = db.prepare('SELECT * FROM rules WHERE project_id = ?').get(projectId);
   const rules = {
@@ -184,6 +189,7 @@ function buildLangView(db, projectId, lang) {
      FROM subtitles WHERE project_id = ? ORDER BY idx`
   ).all(projectId);
   const byCue = activeTranslationsByLang(db, projectId, lang);
+  const glossary = glossaryMod.getGlossary(db, projectId, lang);
 
   const entries = cues.map((cue) => {
     const row = byCue.get(cue.id);
@@ -196,22 +202,35 @@ function buildLangView(db, projectId, lang) {
       invalidReasons = checkTranslationText(row.text, cue, rules);
       valid = state === 'current' && invalidReasons.length === 0;
     }
-    return { cue, translation, state, valid, invalid_reasons: invalidReasons };
+    // 术语核对按当前原文字幕文本精确匹配；术语问题不改变 state/valid
+    const termCheck = glossaryMod.checkTerms(cue.text, row ? row.text : null, glossary.terms);
+    return {
+      cue, translation, state, valid,
+      invalid_reasons: invalidReasons,
+      term_issues: termCheck.missing,
+    };
   });
 
   const counts = {
     cues: cues.length,
     missing: 0, current: 0, review: 0, valid: 0,
+    term_missing: 0,
   };
   for (const e of entries) {
     counts[e.state]++;
     if (e.valid) counts.valid++;
+    if (e.term_issues.length > 0) counts.term_missing++;
   }
   return {
     lang,
     sub_version: project.sub_version,
     rules_version: rules.version,
     rules,
+    glossary: {
+      configured: glossary.configured,
+      version: glossary.version,
+      term_count: glossary.term_count,
+    },
     counts,
     entries,
     exports: db.prepare(
@@ -250,10 +269,14 @@ function listLanguages(db, projectId) {
 /**
  * 按语言导出前核对：
  *   1) 整版源字幕结构（覆盖/重叠/切点/词时段）与现行规则（含时长/字数/字速）必须通过；
- *   2) 当前每行都必须有一份 current 且满足现行字数/字速规则的译文。
- * 通过 → { ok:true, entries }；否则列出 missing/review/invalid/conflicts，不生成快照。
+ *   2) 当前每行都必须有一份 current 且满足现行字数/字速规则的译文；
+ *   3) 该语言配置了术语表时，在既有核对通过的行上按当前术语核对：原文字幕命中的
+ *      源词，其译文必须包含规定译法（一行多词全部满足），缺失归入 term_missing。
+ * 通过 → { ok:true, entries }；否则列出 missing/review/invalid/term_missing/conflicts，
+ * 不生成快照。未配置术语的语言 term_missing 恒为空（不受影响）。
  */
 function evaluateExport(db, projectId, lang) {
+  const glossaryMod = require('./glossary');
   const view = buildLangView(db, projectId, lang);
   const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(projectId);
   const words = db.prepare(
@@ -272,6 +295,9 @@ function evaluateExport(db, projectId, lang) {
   const missing = [];
   const review = [];
   const invalid = [];
+  // 其余条件已满足（有 current 译文且规则通过）的行才做术语闸门，避免与
+  // missing/review/invalid 重复报错（那些问题修正后导出时会再次按当前术语核对）。
+  const termEligible = [];
   for (const e of view.entries) {
     if (!e.translation) {
       missing.push({ subtitle_id: e.cue.id, idx: e.cue.idx, text: e.cue.text });
@@ -285,18 +311,29 @@ function evaluateExport(db, projectId, lang) {
         subtitle_id: e.cue.id, idx: e.cue.idx, text: e.cue.text,
         translation: e.translation, reasons: e.invalid_reasons,
       });
+    } else {
+      termEligible.push(e);
     }
   }
 
+  const glossary = glossaryMod.getGlossary(db, projectId, lang);
+  const byCue = activeTranslationsByLang(db, projectId, lang);
+  const termEval = glossaryMod.evaluateTerms(
+    termEligible.map((e) => e.cue), byCue, glossary,
+    new Set(termEligible.map((e) => e.cue.id))
+  );
+  const termMissing = termEval.rows;
+
   const ok = conflicts.length === 0 && missing.length === 0 &&
-    review.length === 0 && invalid.length === 0;
+    review.length === 0 && invalid.length === 0 && termMissing.length === 0;
   return {
     ok, lang,
     sub_version: project.sub_version,
     rules_version: view.rules_version,
+    glossary_version: glossary.version,
     counts: view.counts,
     entries: view.entries,
-    missing, review, invalid, conflicts,
+    missing, review, invalid, term_missing: termMissing, conflicts,
   };
 }
 

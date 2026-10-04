@@ -287,6 +287,30 @@ CREATE TABLE IF NOT EXISTS attributed_exports (
   created_at        TEXT NOT NULL DEFAULT (datetime('now')),
   UNIQUE(project_id, version)
 );
+
+-- 译审术语对照表：按 项目 + 目标语言 各维护一张“源词 → 规定译法”表。
+-- 整表修改（整体替换词条）并携带术语版本 version（乐观锁）；同语言源词唯一，
+-- 词与译法均为非空文本。未配置术语的语言（无 glossaries 行或词条为空）不做术语核对；
+-- 术语变更不触碰既有译文（current/review 状态均不改变），只在查询/导出时按当前表动态核对。
+CREATE TABLE IF NOT EXISTS glossaries (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  lang       TEXT NOT NULL,                -- 目标语言代号（与译文语言代号同规则）
+  version    INTEGER NOT NULL DEFAULT 1,  -- 每次整表修改 +1；提交携带以拒绝过期写入
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE(project_id, lang)
+);
+
+CREATE TABLE IF NOT EXISTS glossary_terms (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  glossary_id INTEGER NOT NULL REFERENCES glossaries(id) ON DELETE CASCADE,
+  ord         INTEGER NOT NULL,           -- 提交顺序
+  source      TEXT NOT NULL,              -- 源词（非空；同一语言术语表内唯一）
+  target      TEXT NOT NULL,              -- 规定译法（非空；命中源词的译文须包含此文本）
+  UNIQUE(glossary_id, ord)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_glossary_terms_source
+  ON glossary_terms(glossary_id, source);
 `;
 
 const DEFAULT_RULES = { max_chars: 30, min_duration_ms: 800, max_cps: 20 };

@@ -27,6 +27,7 @@
 
 const { validateStructure, validateRules } = require('./layout');
 const { normalizeLang, checkTranslationText, activeTranslationsByLang } = require('./translation');
+const { getGlossary, checkTerms } = require('./glossary');
 
 function isInt(v) {
   return typeof v === 'number' && Number.isInteger(v);
@@ -459,6 +460,8 @@ function evaluateAttributedExport(db, project, request) {
   const submittedVersionByCue = new Map(
     request.translations.map((t) => [t.subtitle_id, t.version])
   );
+  // 译文署名导出还须按该语言当前术语核对（未配置术语的语言不受影响）
+  const glossary = request.lang ? getGlossary(db, project.id, request.lang) : null;
 
   const rows = [];
   const cues = [];
@@ -490,6 +493,7 @@ function evaluateAttributedExport(db, project, request) {
     }
 
     // --- 译文逐行核对（仅选择目标语言时）---
+    let termMissing = [];
     if (request.lang) {
       const submittedVersion = submittedVersionByCue.get(cue.id);
       if (submittedVersion === undefined) {
@@ -515,7 +519,15 @@ function evaluateAttributedExport(db, project, request) {
             codes.push('translation_invalid');
             reasons.push(...ruleReasons);
           } else {
-            text = tr.text;
+            // 版本/状态/规则均通过：按当前术语核对规定译法
+            const termCheck = checkTerms(cue.text, tr.text, glossary ? glossary.terms : []);
+            if (termCheck.missing.length > 0) {
+              codes.push('translation_term_missing');
+              termMissing = termCheck.missing;
+              reasons.push(...termCheck.missing.map((m) => m.reason));
+            } else {
+              text = tr.text;
+            }
           }
         }
       }
@@ -530,6 +542,7 @@ function evaluateAttributedExport(db, project, request) {
         end_ms: cue.end_ms,
         codes,
         reasons,
+        ...(termMissing.length > 0 ? { term_missing: termMissing } : {}),
         attribution: attribution
           ? {
               speaker_id: attribution.speaker_id,
@@ -562,6 +575,7 @@ function evaluateAttributedExport(db, project, request) {
     stale,
     conflicts,
     rows,
+    glossary_version: glossary ? glossary.version : null,
     cues: ok ? cues : null,
     sub_version_current: project.sub_version,
     attribution_version_current: project.attribution_version,
